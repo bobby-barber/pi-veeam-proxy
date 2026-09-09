@@ -1,0 +1,8 @@
+[Unit]
+Description=Keep every Raspberry Pi iSCSI export attached (needed at policy apply and job start)
+After=network-online.target iscsid.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'while read -r PI _; do case "$PI" in ""|\#*) continue;; esac; /usr/local/sbin/pi-attach.sh "$PI" || true; done < /etc/pi-veeam/targets'

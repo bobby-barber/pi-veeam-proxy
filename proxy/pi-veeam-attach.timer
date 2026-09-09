@@ -1,0 +1,9 @@
+[Unit]
+Description=Re-attach Raspberry Pi iSCSI exports every 5 minutes (covers Pi reboots and address changes)
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

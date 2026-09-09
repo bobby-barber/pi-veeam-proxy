@@ -1,0 +1,2 @@
+# /etc/pi-veeam/targets — one Raspberry Pi per line: <ip-or-host> [ssh-user]
+10.10.0.102 pi

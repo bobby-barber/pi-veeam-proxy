@@ -1,0 +1,4 @@
+# Stable, colon-free device aliases for Raspberry Pi iSCSI LUNs so Veeam job objects can reference them.
+# Veeam rejects /dev/disk/by-path names because they contain ':'.
+# One line per Pi; match on the target IQN so the alias survives portal/IP changes and sdX renumbering.
+KERNEL=="sd*", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ENV{ID_PATH}=="*iscsi-iqn.2026-09.local.lab:pi-pi-02-lun-*", SYMLINK+="pi/pi-02"
