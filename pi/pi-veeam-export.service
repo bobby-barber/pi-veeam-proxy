@@ -1,0 +1,13 @@
+[Unit]
+Description=Persistent read-only iSCSI export of this Pi's boot disk for the Veeam proxy
+After=network-online.target tgt.service
+Wants=network-online.target tgt.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/pi-veeam-export.sh idle
+ExecStop=/usr/local/sbin/pi-veeam-export.sh down
+
+[Install]
+WantedBy=multi-user.target

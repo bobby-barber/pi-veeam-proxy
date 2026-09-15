@@ -1,0 +1,36 @@
+--- bdevfilter-submit_bio.h.orig	2026-09-08 02:28:42.722793653 -0500
++++ bdevfilter-submit_bio.h	2026-09-08 02:28:42.764265101 -0500
+@@ -74,7 +74,9 @@
+ static struct ftrace_ops ops_submit_bio_noacct = {
+ 	.func = ftrace_handler_submit_bio_noacct,
+ 	.flags = FTRACE_OPS_FL_DYNAMIC |
++#ifndef CONFIG_HAVE_DYNAMIC_FTRACE_WITH_ARGS
+ 		FTRACE_OPS_FL_SAVE_REGS |
++#endif
+ 		FTRACE_OPS_FL_IPMODIFY |
+ 		FTRACE_OPS_FL_PERMANENT,
+ };
+--- bdevfilter-bdev_mark_dead.h.orig	2026-09-08 02:28:42.801614640 -0500
++++ bdevfilter-bdev_mark_dead.h	2026-09-08 02:28:42.826505413 -0500
+@@ -46,7 +46,9 @@
+ static struct ftrace_ops ops_bdev_mark_dead = {
+ 	.func = ftrace_handler_bdev_mark_dead,
+ 	.flags = FTRACE_OPS_FL_DYNAMIC |
++#ifndef CONFIG_HAVE_DYNAMIC_FTRACE_WITH_ARGS
+ 		FTRACE_OPS_FL_SAVE_REGS |
++#endif
+ 		FTRACE_OPS_FL_IPMODIFY |
+ 		FTRACE_OPS_FL_PERMANENT,
+ };
+--- bdevfilter-del_gendisk.h.orig	2026-09-08 02:28:42.851143910 -0500
++++ bdevfilter-del_gendisk.h	2026-09-08 02:28:42.875983368 -0500
+@@ -70,7 +70,9 @@
+ static struct ftrace_ops ops_del_gendisk = {
+ 	.func = ftrace_handler_del_gendisk,
+ 	.flags = FTRACE_OPS_FL_DYNAMIC |
++#ifndef CONFIG_HAVE_DYNAMIC_FTRACE_WITH_ARGS
+ 		FTRACE_OPS_FL_SAVE_REGS |
++#endif
+ 		FTRACE_OPS_FL_IPMODIFY |
+ 		FTRACE_OPS_FL_PERMANENT,
+ };
