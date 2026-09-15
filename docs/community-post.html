@@ -1,0 +1,341 @@
+<blockquote>
+<p>✦ <strong>All of this seem over your head? Ask Claude to help.</strong> The GitHub repo ships a ready-made prompt that lets Claude Code ask for your addresses, set up SSH, install the proxy and the Pis, and guide you through the Veeam console: <a href="https://github.com/bobby-barber/pi-veeam-proxy/blob/main/DEPLOY-WITH-CLAUDE.md">Deploy it with Claude Code →</a></p>
+<p>There is no Veeam Agent for ARM. There is, however, a way to give the stock Linux agent a frozen, point-in-time image of a Pi's SD card and let it do what it does best. Here is the full build, end to end, almost entirely from the VBR web console.</p>
+</blockquote>
+<p>This started as a weekend puzzle and turned into something I would actually run. I have a couple of Raspberry Pi 4s doing real work: one is a fixed ADS-B flight-tracking ground station, the other rides along in an aircraft. They are cheap, they run for months untouched, and when an SD card finally dies you discover how much configuration lived on it. That is exactly the kind of "small but annoying to rebuild" workload people have scattered across labs, shops and edge sites: signage players, sensor gateways, kiosk controllers, home-automation hubs.</p>
+<p>Fair warning: this is not for the faint of heart. It involves a kernel module built from source on ARM, device-mapper tables, iSCSI, and a handful of shell scripts that have to be right. But once it is configured it just works: the Pis get snapshotted, Veeam backs them up on a schedule with normal retention, and I have done a full bare-metal restore to a brand-new card and booted it. Everything you see below was done on Veeam Backup &amp; Replication v13, and with one small exception, every Veeam step was done in the <strong>web console</strong>.</p>
+<blockquote>
+<p><strong>Read this first.</strong> This is a community project, not a supported Veeam configuration. The Raspberry Pi side uses Veeam's open-source snapshot module built by hand for ARM64, and the orchestration is my own scripting. Test it, own it, and keep the scripts in version control. Nothing here modifies the Veeam appliance itself.</p>
+</blockquote>
+<h2>The problem</h2>
+<p>Veeam Agent for Linux is built for x86_64 (and IBM POWER). There is no aarch64 package, and as of v13 there is none planned, so a Raspberry Pi cannot run the agent. The usual workarounds are weak: a file copy to a share misses the boot partition, the partition table and everything that makes the card bootable, and a periodic <code>dd</code> of a live card gives you a crash-consistent image at best, with no incremental chain, no retention, no restore UI.</p>
+<p>What I wanted was boring: the Pi shows up as a workload in VBR, gets a volume-level backup on a schedule, keeps restore points in a normal repository, and can be restored file-by-file or as a whole card. Veeam can do all of that for a Linux disk. The only thing missing was a way to hand it a Pi's disk.</p>
+<h2>The idea: a proxy that speaks x86</h2>
+<p>If the agent cannot run on the Pi, bring the Pi's disk to the agent. A small x86 Linux VM (I call it <strong>pproxy</strong>) runs the stock Veeam Agent for Linux, managed by VBR like any other Linux server. Each Raspberry Pi exports an image of its SD card over iSCSI to that VM. From Veeam's point of view the proxy is just a Linux machine with some extra block devices, and it backs them up at the volume level.</p>
+<p>The trick that makes this trustworthy rather than a hack is <em>what</em> the Pi exports. It is not the live card. Between backups the Pi presents a read-only view of its partitions. When a backup starts, a pre-job script tells the Pi to freeze its filesystems for an instant, take a block-level snapshot of every partition using Veeam's own open-source <code>blksnap</code> module (built for ARM64), and swap the exported image over to those frozen snapshots. The agent then reads a consistent point-in-time image, and a post-job script releases the snapshot. The live card is never writable from the network, and the snapshot's copy-on-write area lives in RAM on the Pi so it never touches the card either.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>0</strong> changes to the VBR appliance</td>
+<td><strong>~4.5 min</strong> per 32 GB card, per run</td>
+</tr>
+<tr>
+<td><strong>1</strong> VBR license instance for all Pis</td>
+<td><strong>45 min</strong> restore point → booted new card</td>
+</tr>
+</tbody>
+</table>
+<h2>Architecture</h2>
+<p><img alt="Architecture: the Pi keeps its own consistent snapshot; the proxy runs the stock agent; VBR sees an ordinary Linux workload" src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/architecture.png" style="max-width:100%"></p><p><em>Architecture: the Pi keeps its own consistent snapshot; the proxy runs the stock agent; VBR sees an ordinary Linux workload</em></p>
+<table>
+<thead>
+<tr>
+<th>Where</th>
+<th>What runs there</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Raspberry Pi</strong> (pi-01, pi-02 · Pi 4 Model B · Raspberry Pi OS 64-bit, Debian 13)</td>
+<td>Veeam <code>blksnap</code> 13.1.1.4 built via DKMS (with a one-line ARM64 patch), the <code>blksnap</code> CLI, <code>tgt</code>, <code>pi-veeam-export.sh</code> + a systemd unit</td>
+<td>Persistent iSCSI export of a device-mapper disk image. Idle: live partitions, LUN read-only. During a job: frozen snapshot images, LUN read-write.</td>
+</tr>
+<tr>
+<td><strong>Proxy VM</strong> (pproxy · Rocky Linux 9 · x86_64)</td>
+<td>Stock Veeam Agent for Linux 13 with the kernel module, <code>iscsi-initiator-utils</code>, a udev rule, <code>/etc/pi-veeam/targets</code>, pre/post-job scripts, an attach timer</td>
+<td>Attaches each Pi as <code>/dev/pi/&lt;name&gt;</code>, lets the agent back it up as a volume, releases the snapshot afterwards.</td>
+</tr>
+<tr>
+<td><strong>VBR v13</strong> (Software Appliance)</td>
+<td>Protection group "Pi Proxy"; one <em>agent policy</em> per Pi with a Device object; two 2-line wrapper scripts per policy</td>
+<td>Schedules, repository, retention, file-level restore, Publish Disks for bare-metal recovery.</td>
+</tr>
+</tbody>
+</table>
+<h3>What happens during a backup</h3>
+<ol>
+<li><strong>Between runs</strong> the proxy stays logged in to every Pi's read-only export, so <code>/dev/pi/&lt;name&gt;</code> always exists. The agent validates a policy's device objects both when the policy is applied and at the start of every job, before any user script runs, which is why the export has to be persistent.</li>
+<li><strong>Pre-job script</strong> (runs on the proxy, pushed there by VBR): for each Pi in its target list, SSH in and run <code>pi-veeam-export.sh start</code>. The Pi does <code>sync</code>, <code>fsfreeze</code>, takes a blksnap snapshot of every partition, thaws (the freeze lasts well under a second), hot-swaps the device-mapper table to the snapshot images and flips the iSCSI LUN read-write. The proxy re-logs in so it sees the new content and starts change tracking clean.</li>
+<li><strong>The agent</strong> enumerates the disk, finds a real MBR and real ext4/vfat filesystems, takes its own snapshot of the image device and reads only the allocated blocks. On a 32 GB card that is about 9 GB.</li>
+<li><strong>Post-job script</strong>: <code>pi-veeam-export.sh stop</code> on each Pi (LUN back to read-only, table back to the live partitions, snapshot destroyed, RAM freed), then a re-login on the proxy so the device stays present for the next run.</li>
+</ol>
+<h2>Prerequisites</h2>
+<ul>
+<li><strong>VBR v13</strong> with a Linux backup repository. I used the v13 Software Appliance and its web console throughout.</li>
+<li><strong>A small x86_64 VM</strong> for the proxy: Rocky/RHEL 9, 2 vCPU, 4 GB, a static IP. Secure Boot can stay on; you will enroll Veeam's module-signing certificate once.</li>
+<li><strong>Raspberry Pi OS 64-bit</strong> (Debian 12 or 13) on each Pi with kernel headers available, and <strong>Ethernet</strong>. Wi-Fi works, but at roughly one-fifteenth the speed.</li>
+<li><strong>A static IP or DHCP reservation for every Pi</strong> and for the proxy. The proxy addresses Pis by IP, and the Pi's iSCSI ACL names the proxy.</li>
+<li>SSH key access from the proxy's root account to a sudo-capable user on each Pi (the installer sets this up).</li>
+</ul>
+<h2>Part 1 · Build the proxy</h2>
+<p>The proxy is deliberately dull. Rocky Linux 9 minimal, a static address, the iSCSI initiator, and a handful of files from the repo. The Veeam agent itself is installed <em>by VBR</em> later, from the protection group, so there is nothing Veeam-specific to do here by hand.</p>
+<pre><code class="language-bash"># on pproxy, as root
+dnf install -y iscsi-initiator-utils
+systemctl enable --now iscsid
+
+# scripts and units from the repo
+install -m 755 proxy/pi-attach.sh proxy/pi-detach.sh proxy/pi-add-target.sh \
+               proxy/pi-job-pre.sh proxy/pi-job-post.sh /usr/local/sbin/
+install -m 644 proxy/pi-veeam-attach.service proxy/pi-veeam-attach.timer /etc/systemd/system/
+install -d /etc/pi-veeam /etc/pi-veeam/targets.d
+systemctl daemon-reload &amp;&amp; systemctl enable --now pi-veeam-attach.timer
+</code></pre>
+<p>Two details matter. First, VBR rejects a colon in a device path, so the by-path iSCSI names cannot be used as job objects. A udev rule keyed on each Pi's target name provides a clean alias that survives reboots, re-logins and <code>sdX</code> renumbering:</p>
+<pre><code># /etc/udev/rules.d/99-pi-veeam.rules  (one line per Pi; pi-add-target.sh writes it)
+KERNEL==&quot;sd*&quot;, SUBSYSTEM==&quot;block&quot;, ENV{DEVTYPE}==&quot;disk&quot;, \
+  ENV{ID_PATH}==&quot;*iscsi-iqn.2026-09.local.lab:pi-pi-01-lun-*&quot;, SYMLINK+=&quot;pi/pi-01&quot;
+</code></pre>
+<p>Second, the pre-job script does the real orchestration, and it is short. It walks a target list, asks each Pi for a fresh frozen snapshot, then re-logs in to the iSCSI target so the proxy picks up the read-write flag and starts with clean change tracking. It fails the job if any Pi cannot be snapshotted, which is the behavior you want.</p>
+<pre><code class="language-bash"># /usr/local/sbin/pi-job-pre.sh  (excerpt)
+TARGETS=${PI_VEEAM_TARGETS:-/etc/pi-veeam/targets}      # &quot;&lt;ip&gt; &lt;ssh-user&gt;&quot; per line
+KEY=/root/.ssh/id_ed25519_pi
+while read -r PI PI_USER _; do
+  SSH=&quot;ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i $KEY ${PI_USER}@${PI}&quot;
+  $SSH &quot;sudo /usr/local/sbin/pi-veeam-export.sh stop&quot;  &gt;/dev/null 2&gt;&amp;1 || true   # clear a stale one
+  $SSH &quot;sudo /usr/local/sbin/pi-veeam-export.sh start&quot; || { rc=1; continue; }
+  OUT=$(/usr/local/sbin/pi-attach.sh &quot;$PI&quot; --relogin) || { rc=1; continue; }
+  echo &quot;$OUT&quot; | grep -q &quot;ro=0&quot; || rc=1                                          # must be read-write now
+done &lt; &quot;$TARGETS&quot;
+exit $rc
+</code></pre>
+<p>Registering a Pi with the proxy is one command. It appends the targets line, writes the udev rule, and installs the proxy's SSH key on the Pi:</p>
+<pre><code class="language-bash">pi-add-target.sh 10.10.0.101 pi-01 pi        # &lt;pi-ip&gt; &lt;pi-hostname&gt; &lt;ssh-user&gt;
+echo &quot;10.10.0.101 pi&quot; &gt; /etc/pi-veeam/targets.d/pi-01   # per-policy target list
+</code></pre>
+<h2>Part 2 · Prepare the Pi</h2>
+<p>This is the part that is not for the faint of heart, and also the part that is fully scripted. <code>pi/install.sh</code> installs <code>tgt</code>, DKMS and the kernel headers, fetches Veeam's <strong>blksnap DKMS source package</strong> from the public Veeam repository (it is tagged amd64 but contains only C source and a dkms.conf, so it builds anywhere), applies a one-line patch for ARM64, builds and loads the module, builds the <code>blksnap</code> command-line tool from Veeam's GitHub, and installs the export service.</p>
+<pre><code class="language-bash"># on the Pi, as root, from the repo's pi/ directory
+sudo ./install.sh 10.10.0.20            # argument: the proxy's IP (becomes the iSCSI ACL)
+</code></pre>
+<p><strong>The ARM64 patch, in one sentence.</strong> Veeam's filter registers an ftrace handler with <code>FTRACE_OPS_FL_SAVE_REGS</code>; ARM64 kernels implement <code>DYNAMIC_FTRACE_WITH_ARGS</code> instead of <code>WITH_REGS</code> and reject that flag. The same guard the kernel's own livepatch code uses, <code>#ifndef CONFIG_HAVE_DYNAMIC_FTRACE_WITH_ARGS</code>, around that flag in three headers is the entire patch. The module then builds and loads cleanly on the Raspberry Pi 6.x kernels.</p>
+<p>The export script has five modes and is the heart of the design. <code>idle</code> runs at boot and builds a device-mapper image of the whole card: a copy of the MBR and the sectors before the first partition, the partitions themselves (through loop devices, because the mounted partitions cannot be opened exclusively), and a copy of the tail. That image is exported by <code>tgt</code> with the LUN flagged <strong>read-only</strong>, so nothing on the network can write to the card. <code>start</code> and <code>stop</code> are what the proxy calls around each backup:</p>
+<pre><code class="language-bash"># pi-veeam-export.sh start  (excerpt: freeze → snapshot → swap image → LUN read-write)
+SNAP_ID=$(blksnap snapshot_create --device /dev/mmcblk0p1 --device /dev/mmcblk0p2 \
+                                  --file /run/pi-veeam --limit 512M | grep -oE '[0-9a-f-]{36}')
+sync
+for m in /boot/firmware /; do fsfreeze -f &quot;$m&quot;; done      # sub-second
+blksnap snapshot_take --id &quot;$SNAP_ID&quot;
+for m in /boot/firmware /; do fsfreeze -u &quot;$m&quot;; done
+build_table snap | load_table          # dmsetup suspend / reload / resume, then flushbufs
+tgtadm --lld iscsi --op update --mode logicalunit --tid 1 --lun 1 --params readonly=0
+
+# pi-veeam-export.sh stop
+tgtadm --lld iscsi --op update --mode logicalunit --tid 1 --lun 1 --params readonly=1
+build_table live | load_table
+blksnap snapshot_destroy --id &quot;$SNAP_ID&quot;
+</code></pre>
+<p>A few choices in there are deliberate and worth knowing about even if you never edit the script:</p>
+<ul>
+<li><strong>Partitions are snapshotted, not the whole disk.</strong> The blksnap filter binds to the exact block device it is attached to, and filesystems submit I/O on the partition devices. The Veeam agent works the same way.</li>
+<li><strong>The copy-on-write area is in tmpfs</strong> (<code>/run/pi-veeam</code>, 512 MiB). The module refuses to put difference storage on a device it is snapshotting, and a quiet Pi writes very little during a five-minute backup.</li>
+<li><strong>Freeze, then take.</strong> Debian 13's ext4 uses the <code>orphan_file</code> feature; a frozen snapshot mounts cleanly on the proxy, so the agent can see allocated blocks and file-level restore works. This is what the agent does natively on x86.</li>
+<li><strong>The image is served with O_DIRECT</strong> and the page cache is flushed after every table swap, so the proxy never reads stale blocks across a live-to-snapshot swap.</li>
+</ul>
+<h2>Part 3 · Configure Veeam (web console)</h2>
+<p>From here on it is ordinary Veeam administration. Everything in this section is the v13 web console. The single exception, copying two tiny wrapper scripts onto the backup server, can be done through the console's Files view or simply with <code>scp</code>.</p>
+<h3>Protection group and agent deployment</h3>
+<p>Inventory → Protection Groups → Add → Individual computers. The only computer in the group is the proxy. Use an <strong>SSH credential</strong> with automatic privilege elevation. Leave the <em>nosnap</em> agent unchecked: the proxy needs the full agent with the kernel module, because the nosnap variant cannot image plain partitions.</p>
+<p><img alt="Figure 2. The protection group contains exactly one computer: the x86 proxy. Test Connection validates the SSH credential before deployment." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/03.jpg" style="max-width:100%"></p><p><em>Figure 2. The protection group contains exactly one computer: the x86 proxy. Test Connection validates the SSH credential before deployment.</em></p>
+<p><img alt="Figure 3. Connection settings for the proxy. The credential type must be &quot;SSH credentials&quot;." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/04.jpg" style="max-width:100%"></p><p><em>Figure 3. Connection settings for the proxy. The credential type must be &quot;SSH credentials&quot;.</em></p>
+<p><img alt="Figure 4. Deployment options. &quot;Install nosnap backup agent&quot; stays unchecked so VBR deploys the full agent and kmod-blksnap." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/24.jpg" style="max-width:100%"></p><p><em>Figure 4. Deployment options. &quot;Install nosnap backup agent&quot; stays unchecked so VBR deploys the full agent and kmod-blksnap.</em></p>
+<p><img alt="Figure 5. With the proxy discovered, Install Backup Agent pushes the agent packages from the appliance." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/25.jpg" style="max-width:100%"></p><p><em>Figure 5. With the proxy discovered, Install Backup Agent pushes the agent packages from the appliance.</em></p>
+<p><img alt="Figure 6. With Secure Boot enabled the rescan warns about the module signature and offers the veeam-ueficert package. Enroll it once with mokutil --import, reboot, and the warnings are gone." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/26.jpg" style="max-width:100%"></p><p><em>Figure 6. With Secure Boot enabled the rescan warns about the module signature and offers the veeam-ueficert package. Enroll it once with mokutil --import, reboot, and the warnings are gone.</em></p>
+<blockquote>
+<p><strong>Secure Boot.</strong> You do not have to disable Secure Boot on the proxy. Install <code>veeam-ueficert</code> from the Veeam repository, run <code>mokutil --import</code> on its certificate, reboot, and confirm the enrollment in the MOK manager at the console. After that <code>modprobe veeamblksnap</code> loads normally.</p>
+</blockquote>
+<h3>The agent policy</h3>
+<p>Create the backup as an <strong>agent policy</strong> ("Server policy"), not a server-managed job. The difference is where pre-job and post-job scripts run: a server job runs them on the backup server, a policy runs them on the agent, which is where our scripts have to run. The wizard is the standard Linux agent wizard: name, workload (the proxy), volume-level backup, the Pi's device as the object, repository, and the backup server's address.</p>
+<p><img alt="Figure 7. Jobs → New Job → Agent backup job. Choose Server policy." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/42.jpg" style="max-width:100%"></p><p><em>Figure 7. Jobs → New Job → Agent backup job. Choose Server policy.</em></p>
+<p><img alt="Figure 8. Workloads: the proxy, selected from the protection group." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/44.jpg" style="max-width:100%"></p><p><em>Figure 8. Workloads: the proxy, selected from the protection group.</em></p>
+<p><img alt="Figure 9. Backup mode: Volume-level backup." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/45.jpg" style="max-width:100%"></p><p><em>Figure 9. Backup mode: Volume-level backup.</em></p>
+<p><img alt="Figure 10. Objects: Add → Device, and enter the udev alias /dev/pi/&lt;pi-name&gt;. One device object per policy keeps the restore chains separate per Pi." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/46.jpg" style="max-width:100%"></p><p><em>Figure 10. Objects: Add → Device, and enter the udev alias /dev/pi/&lt;pi-name&gt;. One device object per policy keeps the restore chains separate per Pi.</em></p>
+<p><img alt="Figure 11. Backup server: the DNS name the agent will use to reach VBR." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/48.jpg" style="max-width:100%"></p><p><em>Figure 11. Backup server: the DNS name the agent will use to reach VBR.</em></p>
+<h3>Scripts: two lines on the backup server</h3>
+<p>Here is the one piece of plumbing that surprised me and is worth understanding. For an agent policy, VBR does not run a script that already sits on the agent. It reads the script file <em>from the backup server</em>, hashes it, pushes it to the agent under <code>/var/lib/veeam/scripts/&lt;policy-id&gt;/</code>, and runs it there. So the file you point the policy at has to exist on the appliance, and it cannot carry arguments.</p>
+<p>The clean way to satisfy that is a pair of two-line wrappers per policy that just select the right target list and hand off to the real script on the proxy. The real logic stays in the repo; the appliance is touched once, with content that never changes.</p>
+<pre><code class="language-bash"># /var/lib/veeam/scripts/pi-veeam-pre-pi-01.sh   (and a matching -post-)
+#!/bin/bash
+PI_VEEAM_TARGETS=/etc/pi-veeam/targets.d/pi-01 exec /usr/local/sbin/pi-job-pre.sh
+</code></pre>
+<p>Getting those two files onto the appliance is the only step outside the web console. Two options: add the proxy as a managed Linux server (Managed Servers → Add → Linux, with every optional component cleared) and use the console's Files view to copy the files from the proxy to the backup server; or just <code>scp</code> them. I show the console route below because it keeps the whole build inside Veeam tooling.</p>
+<p><img alt="Figure 12. Managed Servers → Add → Linux. Adding the proxy as a managed server makes it visible in the console's Files view." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/58.jpg" style="max-width:100%"></p><p><em>Figure 12. Managed Servers → Add → Linux. Adding the proxy as a managed server makes it visible in the console's Files view.</em></p>
+<p><img alt="Figure 13. Same SSH credential. Open Optional components settings and clear every optional component." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/59.jpg" style="max-width:100%"></p><p><em>Figure 13. Same SSH credential. Open Optional components settings and clear every optional component.</em></p>
+<p><img alt="Figure 14. Review: only OpenSSL, the installer service and the Data Mover will be installed." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/66.jpg" style="max-width:100%"></p><p><em>Figure 14. Review: only OpenSSL, the installer service and the Data Mover will be installed.</em></p>
+<p><img alt="Figure 15. &quot;Linux server saved successfully.&quot; The proxy now has both roles: agent host and managed server." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/67.jpg" style="max-width:100%"></p><p><em>Figure 15. &quot;Linux server saved successfully.&quot; The proxy now has both roles: agent host and managed server.</em></p>
+<p>Then, in the policy: Guest Processing → enable application-aware processing → Customize → select the proxy → Application Settings → <strong>Scripts</strong>. Tick "Enable script execution" and set the two job scripts to the wrapper paths on the backup server.</p>
+<p><img alt="Figure 16. Job scripts point at the wrapper files on the backup server. The web console labels the pair pre-freeze/post-thaw; the thick client calls them pre-job/post-job, which is what they are." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/69.jpg" style="max-width:100%"></p><p><em>Figure 16. Job scripts point at the wrapper files on the backup server. The web console labels the pair pre-freeze/post-thaw; the thick client calls them pre-job/post-job, which is what they are.</em></p>
+<p><img alt="Figure 17. Apply Configuration. VBR hashes and pushes the wrappers to the agent and validates the device object." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/71.jpg" style="max-width:100%"></p><p><em>Figure 17. Apply Configuration. VBR hashes and pushes the wrappers to the agent and validates the device object.</em></p>
+<h2>Part 4 · First run and results</h2>
+<p>Start the policy from the Jobs view and watch the session under Logs &amp; Events. The pre-job script reports success within a few seconds (the Pi snapshot itself takes well under a second; most of the time is the iSCSI re-login), then the agent takes its own snapshot of the image device and reads the allocated blocks.</p>
+<p><img alt="Figure 18. An unattended policy run. Pre-job script executed, volume snapshot created, &quot;Backing up sdb&quot; reads the Pi image at the SD card's native speed." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/73.jpg" style="max-width:100%"></p><p><em>Figure 18. An unattended policy run. Pre-job script executed, volume snapshot created, &quot;Backing up sdb&quot; reads the Pi image at the SD card's native speed.</em></p>
+<p>With two Pis each in their own policy, the Jobs view shows two Linux agent policies for the same host and the Backups view shows two independent chains. That is the layout I recommend: it gives each Pi its own schedule, retention and restore points, with one proxy and one license instance.</p>
+<p><img alt="Figure 19. Jobs: one policy per Pi. VBR allows a machine in one server job, but in several agent policies." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/79.jpg" style="max-width:100%"></p><p><em>Figure 19. Jobs: one policy per Pi. VBR allows a machine in one server job, but in several agent policies.</em></p>
+<p><img alt="Figure 20. Backups: one chain per Pi, named after its policy, with the proxy as the workload." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/80.jpg" style="max-width:100%"></p><p><em>Figure 20. Backups: one chain per Pi, named after its policy, with the proxy as the workload.</em></p>
+<p>Both Pis backed up back-to-back, each run isolated to its own Pi, at 42 to 43 MB/s, which is exactly what a class-10 microSD card delivers locally. VBR reports the bottleneck as "Source" every time. The proxy, the network and the repository are never the limit.</p>
+<h2>Part 5 · Restore, including bare metal</h2>
+<h3>File-level restore</h3>
+<p>Because the Pi's disk carries a real partition table and real filesystems at every stage, a restore point looks like any Linux volume backup. Restore Guest Files mounts the root filesystem in the browser; pick the files and download or restore.</p>
+<p><img alt="Figure 21. File-level restore of a Pi restore point: bootfs and rootfs, browsable like any other Linux agent backup." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/31.jpg" style="max-width:100%"></p><p><em>Figure 21. File-level restore of a Pi restore point: bootfs and rootfs, browsable like any other Linux agent backup.</em></p>
+<h3>Bare-metal restore to a new card</h3>
+<p>This is the test that matters, and it worked on the first boot. The path is Publish Disks in the web console, a small amount of shell on the proxy to turn the published partitions back into a bootable card image, and a card writer.</p>
+<p><img alt="Figure 22. Select the restore point under the Pi's policy. Publish Disks is the one for a whole-card image." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/81.jpg" style="max-width:100%"></p><p><em>Figure 22. Select the restore point under the Pi's policy. Publish Disks is the one for a whole-card image.</em></p>
+<p><img alt="Figure 23. Publish Disks: machine → restore point → Disk 0 → target server. Publish to the proxy itself." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/82.jpg" style="max-width:100%"></p><p><em>Figure 23. Publish Disks: machine → restore point → Disk 0 → target server. Publish to the proxy itself.</em></p>
+<p><img alt="Figure 24. About two minutes later the disk is mounted on the proxy. The partitions appear as files under /run/media/Veeam.Mount.Disks/&lt;session&gt;/." src="https://raw.githubusercontent.com/bobby-barber/pi-veeam-proxy/main/docs/img/blog/84.jpg" style="max-width:100%"></p><p><em>Figure 24. About two minutes later the disk is mounted on the proxy. The partitions appear as files under /run/media/Veeam.Mount.Disks/&lt;session&gt;/.</em></p>
+<p>Publish Disks hands you the <em>partitions</em>, not a whole disk with an MBR. That is fine for a Raspberry Pi as long as you rebuild the partition table with the original disk identifier, because Raspberry Pi OS boots by <code>PARTUUID=&lt;disk-id&gt;-02</code> in <code>cmdline.txt</code> and <code>fstab</code>. Save one <code>sfdisk -d /dev/mmcblk0</code> dump per Pi with your documentation; the rebuild script reads everything it needs from it.</p>
+<pre><code class="language-bash"># on pproxy, as root, after Publish Disks
+pi-rebuild-image.sh /run/media/Veeam.Mount.Disks/&lt;session&gt; sfdisk-pi-01.txt /var/tmp/pi-01.img
+#   truncate to the original size → sfdisk the saved table (same label-id) → dd each partition file
+#   to its original byte offset with conv=sparse.  53 seconds for a 32 GB card, 9.3 GB allocated.
+
+# &quot;32 GB&quot; cards are not all the same size (mine was 711 MB smaller). Shrink to fit the new card:
+pi-fit-image.sh /var/tmp/pi-01.img 61132800 sfdisk-pi-01.txt     # card size in 512-byte sectors
+#   e2fsck -fy (replays the journal) → resize2fs → sfdisk with the shorter partition 2 → truncate
+
+pigz -6 -k /var/tmp/pi-01.img                                     # 2.4 GB .img.gz, 84 s
+</code></pre>
+<blockquote>
+<p><strong>e2fsprogs version.</strong> Debian 13 formats ext4 with the <code>orphan_file</code> feature. Rocky 9 ships e2fsprogs 1.46, which does not understand it; build 1.47.2 from kernel.org into <code>/opt/e2fsprogs</code> on the proxy (about two minutes) and the fit script uses it automatically.</p>
+</blockquote>
+<p>The <code>.img.gz</code> is exactly what Raspberry Pi Imager consumes, or write it from a laptop:</p>
+<pre><code class="language-bash">diskutil unmountDisk /dev/disk8      # macOS; use lsblk + umount on Linux
+gunzip -c pi-01.img.gz | sudo dd of=/dev/rdisk8 bs=4m status=progress &amp;&amp; sync
+</code></pre>
+<p>Card in the Pi, power on. Here is the restored Pi one minute later. The new card reports 61,132,800 sectors (the original was 62,521,344), the root filesystem is clean at its new size, every service is up, and the FlightAware feeder re-registered with the same site and feeder ID.</p>
+<pre><code>pi@pi-01:~ $ uptime -p; sudo fdisk -l /dev/mmcblk0 | grep -E 'sectors$|^/dev'; df -h / | tail -1
+up 3 minutes
+Disk /dev/mmcblk0: 29.15 GiB, 31299993600 bytes, 61132800 sectors
+/dev/mmcblk0p1       16384  1064959  1048576  512M  c W95 FAT32 (LBA)
+/dev/mmcblk0p2     1064960 61132799 60067840 28.6G 83 Linux
+/dev/mmcblk0p2   29G  7.7G   20G  29% /
+pi@pi-01:~ $ systemctl is-active dump1090-fa dump978-fa piaware fr24feed adsbexchange-feed | tr '\n' ' '
+active active active active active
+pi@pi-01:~ $ sudo journalctl -b -o cat | grep 'EXT4-fs (mmcblk0p2)'
+EXT4-fs (mmcblk0p2): orphan cleanup on readonly fs
+EXT4-fs (mmcblk0p2): mounted filesystem d6944274-… ro with ordered data mode. Quota mode: none.
+EXT4-fs (mmcblk0p2): re-mounted d6944274-… r/w.
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Restore step</th>
+<th>Where</th>
+<th>Time</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Publish Disks (register, data mover, mount)</td>
+<td>web console → proxy</td>
+<td>1 min 46 s</td>
+</tr>
+<tr>
+<td>Rebuild whole-disk sparse image</td>
+<td>proxy</td>
+<td>53 s</td>
+</tr>
+<tr>
+<td>Fit to the new card (fsck, resize2fs, table, truncate)</td>
+<td>proxy</td>
+<td>5 s</td>
+</tr>
+<tr>
+<td>Compress and copy to the laptop</td>
+<td>proxy → LAN</td>
+<td>~3 min</td>
+</tr>
+<tr>
+<td>Write the microSD (USB reader)</td>
+<td>laptop</td>
+<td>35 min 38 s at 14.6 MB/s</td>
+</tr>
+<tr>
+<td>Boot, services re-register</td>
+<td>Pi</td>
+<td>~1 min</td>
+</tr>
+</tbody>
+</table>
+<p>Restore point to running Pi in about 45 minutes, and 36 of those are the card writer. Veeam's part is under ten.</p>
+<h2>Scaling to more Pis</h2>
+<p>Adding a Pi is five steps, three of them one-liners: run <code>install.sh</code> on the Pi, run <code>pi-add-target.sh</code> on the proxy and write its <code>targets.d</code> file, copy its two wrappers to the backup server, create the policy with <code>/dev/pi/&lt;name&gt;</code> as the object and those wrappers as scripts, Apply Configuration. Stagger the schedules; the agent processes one job at a time, and each 32 GB card takes about four and a half minutes.</p>
+<p>Two things to check when you add a Pi. Every Raspberry Pi OS card carries the labels <em>bootfs</em> and <em>rootfs</em>, so in file-level restore pick by disk, not by label. And the agent identifies a disk by its MBR signature: cards cloned from the same image can carry the same identifier. Raspberry Pi OS regenerates it at first boot, so this is rare, but if two collide, change one with <code>fdisk</code> and update the PARTUUID references in <code>cmdline.txt</code> and <code>fstab</code>.</p>
+<h2>Performance numbers</h2>
+<p>All from this lab: Pi 4 Model B, 32 GB class-10 microSD, Rocky 9 proxy VM, v13 Software Appliance with a local repository.</p>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Rate</th>
+<th>Note</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SD card, sequential read on the Pi</td>
+<td>44 MB/s</td>
+<td>the ceiling for everything below</td>
+</tr>
+<tr>
+<td>Pi on 2.4 GHz Wi-Fi → proxy over iSCSI</td>
+<td>3.3 MB/s</td>
+<td>a 32 GB card takes ~2.5 h; use Ethernet</td>
+</tr>
+<tr>
+<td>Pi on Ethernet → proxy over iSCSI</td>
+<td>40–57 MB/s</td>
+<td>the card is the bottleneck, not the network</td>
+</tr>
+<tr>
+<td>Veeam policy run, one Pi, Ethernet</td>
+<td>9 GB read at 42.5 MB/s, ~4.5 min</td>
+<td>agent reads allocated blocks only (9 of 32 GB)</td>
+</tr>
+<tr>
+<td>Two Pis, back-to-back policies</td>
+<td>9 GB each, 8 min 17 s total</td>
+<td>disks are read sequentially</td>
+</tr>
+<tr>
+<td>Publish Disks read on the proxy</td>
+<td>~175 MB/s</td>
+<td>9.3 GB image rebuilt in 53 s</td>
+</tr>
+<tr>
+<td>microSD write from a laptop</td>
+<td>14.6 MB/s</td>
+<td>the slowest step of a restore</td>
+</tr>
+</tbody>
+</table>
+<h2>Why it is built this way</h2>
+<p><strong>Persistent, read-only export.</strong> The agent checks a policy's device objects at apply time and at job start, before any script runs. So the Pi keeps its target up permanently, but read-only over the live partitions. Only during a job does the image switch to frozen snapshots and become writable, and even then writes land in the Pi's RAM, never on the card.</p>
+<p><strong>Policies, not server jobs.</strong> Server-job scripts run on the backup server. Agent-policy pre-job and post-job scripts run on the agent, before enumeration and after the read. That is the contract these hooks need, and it also lets one proxy carry one policy per Pi.</p>
+<p><strong>Real filesystems at every stage.</strong> The exported image always has a real MBR and mountable partitions, whether it is showing the live card or a snapshot. That is what keeps the agent's used-block detection working (9 GB read instead of 32) and makes file-level restore possible.</p>
+<p><strong>Full agent, kernel module, Secure Boot kept on.</strong> The proxy runs the same agent build you would install anywhere else, with Veeam's signed module and Veeam's UEFI certificate enrolled. Nothing on the proxy is patched or unsigned.</p>
+<h2>Or let Claude Code do the install</h2>
+<p>Everything on the Linux side of this build is reproducible from the repository, which makes it a good fit for an AI coding agent. The repo ships a ready-made prompt, <a href="https://github.com/bobby-barber/pi-veeam-proxy/blob/main/DEPLOY-WITH-CLAUDE.md">DEPLOY-WITH-CLAUDE.md</a>, for <a href="https://claude.com/claude-code">Claude Code</a>. Clone the repo, open it in Claude Code, paste the prompt, and it will:</p>
+<ul>
+<li>ask you for the proxy's and each Pi's address, name and SSH user, and check that the addresses are static;</li>
+<li>test SSH to every host and help you fix what is missing (it hands you the <code>ssh-copy-id</code> command to run yourself; it never handles your passwords);</li>
+<li>install the proxy side, create the proxy's key for reaching the Pis and install it on each of them;</li>
+<li>run <code>install.sh</code> on each Pi, one at a time, and verify the read-only export before moving on;</li>
+<li>register every Pi on the proxy, generate its wrapper pair, and dry-run the pre/post hooks so you see the snapshot appear and disappear;</li>
+<li>hand you the wrapper files for the backup server, then walk you through the web console steps above one at a time, checking the session log with you on the first run;</li>
+<li>save each Pi's <code>sfdisk -d</code> dump into the repo so a bare-metal restore has what it needs.</li>
+</ul>
+<pre><code class="language-bash"># the whole thing, from a laptop
+git clone https://github.com/bobby-barber/pi-veeam-proxy.git &amp;&amp; cd pi-veeam-proxy &amp;&amp; claude
+# then paste the prompt from DEPLOY-WITH-CLAUDE.md
+</code></pre>
+<p>The prompt is deliberately conservative: it shows every remote command before running it, asks before anything hard to reverse, never writes to a Pi's card, and stops at the two things only a human can do, which are typing passwords and pressing the Secure Boot enrollment keys at the proxy's console.</p>
+<h2>Wrap-up</h2>
+<p>Is this something Veeam supports? No, and I would not put it in front of a customer as a product feature. Is it something I now run for my own Pis, with a nightly schedule, normal retention, and a restore I have actually tested to a new card? Yes. The heavy lifting, consistent snapshots, incremental chains, retention, file-level restore, disk publishing, all of it is stock Veeam Backup &amp; Replication. The Pi side is a kernel module Veeam already publishes as open source, plus a few hundred lines of shell.</p>
+<p>If you have Raspberry Pis doing real work somewhere, give it a try in a lab first. The scripts, the ARM64 patch, the systemd units and the restore tooling are in the repository below, along with the full build log this article was distilled from.</p>
+<p><strong>Repository:</strong> https://github.com/bobby-barber/pi-veeam-proxy · Pi installer and export script · proxy hooks and udev rule · image rebuild and fit scripts · design notes and command reference.</p>
